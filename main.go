@@ -89,28 +89,9 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// client assertion JWT
+	// oauth
 
 	issuer := "http://localhost:8080/auth/realms/master"
-
-	clientAuthClaims := jwt.Claims{
-		// subject needs to match the client ID,
-		// see https://github.com/keycloak/keycloak/blob/b478472b3578b8980d7b5f1642e91e75d1e78d16/services/src/main/java/org/keycloak/authentication/authenticators/client/JWTClientAuthenticator.java#L102-L105
-		Subject: "telemeter",
-
-		// audience needs to match realm issuer,
-		// see https://github.com/keycloak/keycloak/blob/b478472b3578b8980d7b5f1642e91e75d1e78d16/services/src/main/java/org/keycloak/authentication/authenticators/client/JWTClientAuthenticator.java#L142-L144
-		Audience: []string{issuer},
-
-		IssuedAt: jwt.NewNumericDate(time.Now()),
-	}
-
-	clientAuthJWT, err := jwt.Signed(signer).Claims(clientAuthClaims).CompactSerialize()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// oauth
 
 	ctx := context.Background()
 	provider, err := oidc.NewProvider(ctx, issuer)
@@ -130,9 +111,21 @@ func main() {
 
 	client := &http.Client{
 		Timeout: 20 * time.Second,
-		Transport: &jwtClientAuthenticator{
-			jwt:  clientAuthJWT,
-			next: transport,
+		Transport: &debugRoundTripper{
+			&jwtClientAuthenticator{
+				claims: Claims{
+					// subject needs to match the client ID,
+					// see https://github.com/keycloak/keycloak/blob/b478472b3578b8980d7b5f1642e91e75d1e78d16/services/src/main/java/org/keycloak/authentication/authenticators/client/JWTClientAuthenticator.java#L102-L105
+					Subject: "telemeter",
+
+					// audience needs to match realm issuer,
+					// see https://github.com/keycloak/keycloak/blob/b478472b3578b8980d7b5f1642e91e75d1e78d16/services/src/main/java/org/keycloak/authentication/authenticators/client/JWTClientAuthenticator.java#L142-L144
+					Audience: []string{issuer},
+				},
+
+				signer: signer,
+				next:   transport,
+			},
 		},
 	}
 
@@ -153,16 +146,57 @@ func main() {
 		fmt.Println(tok.RefreshToken)
 
 		fmt.Println("retrying in 1 minute and 30 seconds")
-		time.Sleep(time.Minute + 30*time.Second)
+		time.Sleep(30 * time.Second)
 	}
 }
 
-type jwtClientAuthenticator struct {
-	jwt  string
+type debugRoundTripper struct {
 	next http.RoundTripper
 }
 
+func (rt *debugRoundTripper) RoundTrip(req *http.Request) (res *http.Response, err error) {
+	res, err = rt.next.RoundTrip(req)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	reqd, _ := httputil.DumpRequest(req, true)
+	log.Println("request", string(reqd))
+
+	resd, _ := httputil.DumpResponse(res, true)
+	log.Println("response", string(resd))
+
+	return
+}
+
+type Claims struct {
+	Issuer   string
+	Subject  string
+	Audience []string
+	ID       string
+}
+
+type jwtClientAuthenticator struct {
+	claims Claims
+	signer jose.Signer
+	next   http.RoundTripper
+}
+
 func (rt *jwtClientAuthenticator) RoundTrip(req *http.Request) (*http.Response, error) {
+	clientAuthClaims := jwt.Claims{
+		Issuer:   rt.claims.Issuer,
+		Subject:  rt.claims.Subject,
+		Audience: rt.claims.Audience,
+		ID:       rt.claims.ID,
+		IssuedAt: jwt.NewNumericDate(time.Now()),
+	}
+
+	clientAuthJWT, err := jwt.Signed(rt.signer).Claims(clientAuthClaims).CompactSerialize()
+	if err != nil {
+		return nil, err
+	}
+
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Del("Authorization") // replaced with client assertion
 
@@ -171,7 +205,7 @@ func (rt *jwtClientAuthenticator) RoundTrip(req *http.Request) (*http.Response, 
 	}
 
 	req.Form.Set("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
-	req.Form.Set("client_assertion", rt.jwt)
+	req.Form.Set("client_assertion", clientAuthJWT)
 
 	newBody := req.Form.Encode()
 	req.Body = ioutil.NopCloser(strings.NewReader(string(newBody)))
