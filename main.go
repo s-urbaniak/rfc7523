@@ -111,21 +111,22 @@ func main() {
 
 	client := &http.Client{
 		Timeout: 20 * time.Second,
-		Transport: &debugRoundTripper{
-			&jwtClientAuthenticator{
-				claims: Claims{
-					// subject needs to match the client ID,
-					// see https://github.com/keycloak/keycloak/blob/b478472b3578b8980d7b5f1642e91e75d1e78d16/services/src/main/java/org/keycloak/authentication/authenticators/client/JWTClientAuthenticator.java#L102-L105
-					Subject: "telemeter",
+		Transport: &jwtClientAuthenticator{
+			claims: Claims{
+				// subject needs to match the client ID,
+				// see https://github.com/keycloak/keycloak/blob/b478472b3578b8980d7b5f1642e91e75d1e78d16/services/src/main/java/org/keycloak/authentication/authenticators/client/JWTClientAuthenticator.java#L102-L105
+				Subject: "telemeter",
 
-					// audience needs to match realm issuer,
-					// see https://github.com/keycloak/keycloak/blob/b478472b3578b8980d7b5f1642e91e75d1e78d16/services/src/main/java/org/keycloak/authentication/authenticators/client/JWTClientAuthenticator.java#L142-L144
-					Audience: []string{issuer},
-				},
-
-				signer: signer,
-				next:   transport,
+				// audience needs to match realm issuer,
+				// see https://github.com/keycloak/keycloak/blob/b478472b3578b8980d7b5f1642e91e75d1e78d16/services/src/main/java/org/keycloak/authentication/authenticators/client/JWTClientAuthenticator.java#L142-L144
+				Audience: []string{issuer},
 			},
+
+			expiry: 10 * time.Second,
+			signer: signer,
+			next:   &debugRoundTripper{transport},
+
+			now: time.Now,
 		},
 	}
 
@@ -133,19 +134,12 @@ func main() {
 
 	src := cfg.TokenSource(ctx)
 	for {
-		tok, err := src.Token()
+		_, err := src.Token()
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		log.Println("--- Access Token Expiry")
-		log.Println(tok.Expiry)
-		log.Println("--- Access Token")
-		fmt.Println(tok.AccessToken)
-		log.Println("--- Refresh Token")
-		fmt.Println(tok.RefreshToken)
-
-		fmt.Println("retrying in 1 minute and 30 seconds")
+		fmt.Println("sleeping 30 seconds")
 		time.Sleep(30 * time.Second)
 	}
 }
@@ -155,14 +149,14 @@ type debugRoundTripper struct {
 }
 
 func (rt *debugRoundTripper) RoundTrip(req *http.Request) (res *http.Response, err error) {
+	reqd, _ := httputil.DumpRequest(req, true)
+	log.Println("request", string(reqd))
+
 	res, err = rt.next.RoundTrip(req)
 	if err != nil {
 		log.Println(err)
 		return
 	}
-
-	reqd, _ := httputil.DumpRequest(req, true)
-	log.Println("request", string(reqd))
 
 	resd, _ := httputil.DumpResponse(res, true)
 	log.Println("response", string(resd))
@@ -180,16 +174,23 @@ type Claims struct {
 type jwtClientAuthenticator struct {
 	claims Claims
 	signer jose.Signer
+	expiry time.Duration
 	next   http.RoundTripper
+
+	now func() time.Time
 }
 
 func (rt *jwtClientAuthenticator) RoundTrip(req *http.Request) (*http.Response, error) {
+	now := rt.now()
+
 	clientAuthClaims := jwt.Claims{
-		Issuer:   rt.claims.Issuer,
-		Subject:  rt.claims.Subject,
-		Audience: rt.claims.Audience,
-		ID:       rt.claims.ID,
-		IssuedAt: jwt.NewNumericDate(time.Now()),
+		Issuer:    rt.claims.Issuer,
+		Subject:   rt.claims.Subject,
+		Audience:  rt.claims.Audience,
+		ID:        rt.claims.ID,
+		Expiry:    jwt.NewNumericDate(now.Add(rt.expiry)),
+		IssuedAt:  jwt.NewNumericDate(now),
+		NotBefore: jwt.NewNumericDate(now.Add(-10 * time.Second)),
 	}
 
 	clientAuthJWT, err := jwt.Signed(rt.signer).Claims(clientAuthClaims).CompactSerialize()
