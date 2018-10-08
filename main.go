@@ -2,15 +2,12 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"encoding/base32"
 	"encoding/json"
-	"fmt"
 	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -19,46 +16,21 @@ import (
 	"github.com/coreos/go-oidc"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/clientcredentials"
+	kingpin "gopkg.in/alecthomas/kingpin.v2"
 	jose "gopkg.in/square/go-jose.v2"
 	"gopkg.in/square/go-jose.v2/jwt"
 )
 
+var (
+	jwkPath = kingpin.Flag("jwk-path", "the private JWK used for signing client assertion JWTs").Required().ExistingFile()
+)
+
 func main() {
-	// json web key setup - JWK
+	kingpin.Parse()
 
-	bits := 2048
-	pk, err := rsa.GenerateKey(rand.Reader, bits)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	use := "sig"
-	sigAlg := jose.RS256
-	var kid string
-	{
-		b := make([]byte, 5)
-		_, err := rand.Read(b)
-		if err != nil {
-			log.Fatal(err)
-		}
-		kid = base32.StdEncoding.EncodeToString(b)
-	}
-
-	privJWK := jose.JSONWebKey{
-		Key:       pk,
-		KeyID:     kid,
-		Use:       use,
-		Algorithm: string(sigAlg),
-	}
-
-	pubJWK := jose.JSONWebKey{
-		Key:       pk.Public(),
-		KeyID:     kid,
-		Use:       use,
-		Algorithm: string(sigAlg),
-	}
-
-	pubJWKS := jose.JSONWebKeySet{[]jose.JSONWebKey{pubJWK}}
+	// generate with i.e. `jwk-keygen --use=sig --alg=RS512 --bits=4096 --kid-rand`
+	privJWK := mustParseJWK(*jwkPath)
+	pubJWKS := jose.JSONWebKeySet{[]jose.JSONWebKey{privJWK.Public()}}
 
 	// the `/jwks` endpoint hosting the JWK public key content
 
@@ -76,12 +48,12 @@ func main() {
 
 	signer, err := jose.NewSigner(
 		jose.SigningKey{
-			Algorithm: sigAlg,
 			Key:       privJWK,
+			Algorithm: jose.RS512,
 		},
 		&jose.SignerOptions{
 			// this will only embed the JWK's key ID "kid"
-			// the public key content is retrieved using the `/jwks` endpoint
+			// the public key content can be retrieved using the `/jwks` endpoint
 			EmbedJWK: false,
 		},
 	)
@@ -134,13 +106,14 @@ func main() {
 
 	src := cfg.TokenSource(ctx)
 	for {
-		_, err := src.Token()
+		t, err := src.Token()
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		fmt.Println("sleeping 30 seconds")
-		time.Sleep(30 * time.Second)
+		s := 10 * time.Second
+		log.Println("got token (expires", t.Expiry, ") sleeping", s)
+		time.Sleep(s)
 	}
 }
 
@@ -209,7 +182,7 @@ func (rt *jwtClientAuthenticator) RoundTrip(req *http.Request) (*http.Response, 
 	req.Form.Set("client_assertion", clientAuthJWT)
 
 	newBody := req.Form.Encode()
-	req.Body = ioutil.NopCloser(strings.NewReader(string(newBody)))
+	req.Body = ioutil.NopCloser(strings.NewReader(newBody))
 	req.ContentLength = int64(len(newBody))
 
 	return rt.next.RoundTrip(req)
@@ -221,4 +194,17 @@ func mustMarshal(src json.Marshaler) []byte {
 		panic(err)
 	}
 	return bytes
+}
+
+func mustParseJWK(path string) *jose.JSONWebKey {
+	var jwk jose.JSONWebKey
+	f, err := os.Open(path)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer f.Close()
+	if err := json.NewDecoder(f).Decode(&jwk); err != nil {
+		log.Fatal(err)
+	}
+	return &jwk
 }
